@@ -2,7 +2,14 @@
 .gitignore
 build
 build-*
-checkpoints
+checkpoints/
+.embodied-models/
+**/*.gguf
+**/*.safetensors
+**/*.ckpt
+**/*.onnx
+**/*.h5
+**/*.hdf5
 third_party
 eval/sim/libero/LIBERO
 eval/sim/libero/libero_uv
