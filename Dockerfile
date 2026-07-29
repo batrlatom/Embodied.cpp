@@ -2,7 +2,10 @@
 
 FROM nvcr.io/nvidia/pytorch:25.12-py3
 
-ARG CUDA_ARCHITECTURES=86
+# Build native SASS for both the RTX 3090 and RTX 5080. This avoids requiring
+# the host driver to JIT CUDA 13.1 PTX on systems whose driver supports CUDA
+# 13.0 but rejects newer PTX toolchains.
+ARG CUDA_ARCHITECTURES=86;120
 ARG LLAMA_REF=b9016
 ARG PI05_HF_REPO=SEU-PAISys/Embodied.cpp
 ARG PI05_HF_REVISION=main
