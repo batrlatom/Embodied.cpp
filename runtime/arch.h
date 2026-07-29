@@ -43,6 +43,7 @@ enum class Arch {
     LINGBOT_VA, ///< Robbyant LingBot-VA video-action world model.
     HY_VLA,     ///< Tencent Hy-Embodied-0.5-VLA dual-tower flow policy.
     GROOT_N1,   ///< NVIDIA GR00T N1 vision-language-action policy.
+    QANTARA,    ///< Qantara joint bridge-flow world/action predictor.
 };
 
 /**
@@ -108,6 +109,10 @@ std::unique_ptr<ModelArchBase> lingbot_va_create(const std::string& mmproj_path,
 std::unique_ptr<ModelArchBase> hy_vla_create(const std::string& mmproj_path,
                                              const std::string& ckpt_path,
                                              const std::string& config_path);
+
+std::unique_ptr<ModelArchBase> qantara_create(const std::string& mmproj_path,
+                                              const std::string& ckpt_path,
+                                              const std::string& config_path);
 
 std::unique_ptr<ModelArchBase> groot_n1_create(const std::string& mmproj_path,
                                                const std::string& ckpt_path,

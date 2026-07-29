@@ -11,6 +11,7 @@ option(MODEL_BUILD_VLA_PI05 "Build pi0.5 runtime support" OFF)
 option(MODEL_BUILD_VLA_HY_VLA "Build HY-VLA runtime support" OFF)
 option(MODEL_BUILD_VLA_GROOT_N1 "Build NVIDIA GR00T N1 runtime support" OFF)
 option(MODEL_BUILD_WAM_LINGBOT_VA "Build LingBot-VA runtime support" OFF)
+option(MODEL_BUILD_WAM_QANTARA "Build minimal Qantara predictor runtime support" OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -38,6 +39,9 @@ endif()
 if(MODEL_BUILD_WAM_LINGBOT_VA)
     target_sources(vla_core PRIVATE models/lingbot_va.cpp)
 endif()
+if(MODEL_BUILD_WAM_QANTARA)
+    target_sources(vla_core PRIVATE models/qantara.cpp)
+endif()
 target_include_directories(vla_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -50,8 +54,18 @@ target_compile_definitions(vla_core PUBLIC
     MODEL_BUILD_VLA_HY_VLA=$<BOOL:${MODEL_BUILD_VLA_HY_VLA}>
     MODEL_BUILD_VLA_GROOT_N1=$<BOOL:${MODEL_BUILD_VLA_GROOT_N1}>
     MODEL_BUILD_WAM_LINGBOT_VA=$<BOOL:${MODEL_BUILD_WAM_LINGBOT_VA}>
+    MODEL_BUILD_WAM_QANTARA=$<BOOL:${MODEL_BUILD_WAM_QANTARA}>
 )
 target_link_libraries(vla_core PUBLIC llama ggml mtmd)
+
+if(MODEL_BUILD_WAM_QANTARA)
+    add_executable(qantara-predictor-bench eval/qantara_predictor_bench.cpp)
+    target_include_directories(qantara-predictor-bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    )
+    target_link_libraries(qantara-predictor-bench PRIVATE vla_core)
+endif()
 
 set(EMBODIED_ENABLED_MODELS "")
 if(MODEL_BUILD_VLA_PI05)
@@ -65,6 +79,9 @@ if(MODEL_BUILD_VLA_GROOT_N1)
 endif()
 if(MODEL_BUILD_WAM_LINGBOT_VA)
     list(APPEND EMBODIED_ENABLED_MODELS "WAM/LingBot-VA")
+endif()
+if(MODEL_BUILD_WAM_QANTARA)
+    list(APPEND EMBODIED_ENABLED_MODELS "WAM/Qantara")
 endif()
 if(EMBODIED_ENABLED_MODELS)
     string(REPLACE ";" ", " EMBODIED_ENABLED_MODELS_STR "${EMBODIED_ENABLED_MODELS}")
@@ -114,6 +131,8 @@ if(GGML_CUDA)
     endif()
 endif()
 
+if(MODEL_BUILD_VLA_PI05 OR MODEL_BUILD_VLA_HY_VLA OR
+   MODEL_BUILD_VLA_GROOT_N1 OR MODEL_BUILD_WAM_LINGBOT_VA)
 find_package(Protobuf REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZeroMQ REQUIRED IMPORTED_TARGET libzmq)
@@ -196,4 +215,5 @@ if(MODEL_BUILD_WAM_LINGBOT_VA)
         ${Protobuf_LIBRARIES}
         PkgConfig::ZeroMQ
     )
+endif()
 endif()

@@ -504,6 +504,7 @@ GGUF conversion scripts are in [`scripts/`](scripts/):
 | `prepare_groot_n1_backbone.py` | Extracted, layer-truncated Qwen3-VL Hugging Face directory |
 | `convert_hy_vla_to_gguf.py` | HY-VLA combined vision+action |
 | `convert_lingbot_va_to_gguf.py` | LingBot-VA transformer + companion GGUFs |
+| `convert_qantara_to_gguf.py` | Minimal Qantara dense predictor |
 
 Quantization helpers:
 
@@ -516,13 +517,55 @@ If you do not need a custom conversion, prefer the prebuilt GGUF releases at:
 
 - https://huggingface.co/SEU-PAISys/Embodied.cpp
 
+### Qantara predictor parity prototype
+
+The initial Qantara integration isolates the dense predictor used by the
+`video_inverse` action-block latency measurement. It accepts precomputed
+Qantara latents, aligned previous action blocks, and fixed video/action noise.
+It does not yet include the ViT encoder, server-side episode history,
+multicamera/task conditioning, prefix planning, or RoboTTT.
+
+Prepare llama.cpp, convert a dense single-camera checkpoint, and build:
+
+```bash
+./patches/init_third_party.sh
+
+python scripts/convert_qantara_to_gguf.py \
+  /path/to/qantara-checkpoint.pt \
+  checkpoints/qantara-predictor-f32.gguf \
+  --flow-steps 4
+
+cmake -S . -B build-qantara \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DMODEL_BUILD_WAM_QANTARA=ON
+cmake --build build-qantara --target qantara-predictor-bench -j$(nproc)
+```
+
+`BUILD_SHARED_LIBS=OFF` is useful on filesystems that do not support symbolic
+links. For CUDA, also pass `-DGGML_CUDA=ON`,
+`-DCMAKE_CUDA_COMPILER=<path-to-nvcc>`, and the appropriate
+`-DCMAKE_CUDA_ARCHITECTURES` value.
+
+Generate a deterministic fixture and compare native output with PyTorch:
+
+```bash
+python eval/export_qantara_parity.py \
+  /path/to/qantara-checkpoint.pt \
+  checkpoints/qantara-parity.bin \
+  --qantara-repo /path/to/qantara/source \
+  --flow-steps 4 \
+  --executable build-qantara/qantara-predictor-bench \
+  --gguf checkpoints/qantara-predictor-f32.gguf
+```
+
 ## 5. 🗂️ Project Structure
 
 What lives where, in plain language:
 
 | Directory | What it contains |
 |---|---|
-| `models/` | C++ model implementations (pi0.5, GR00T N1.7, HY-VLA, LingBot-VA) |
+| `models/` | C++ model implementations (pi0.5, GR00T N1.7, HY-VLA, LingBot-VA, Qantara predictor) |
 | `runtime/` | Model registry, architecture detection, shared utilities |
 | `adapter/` | I/O boundary — translates sensor/simulator data into typed inputs the models understand |
 | `serving/` | Server code (ZeroMQ/Protobuf) for VLA and LingBot APIs |

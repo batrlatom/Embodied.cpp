@@ -157,6 +157,16 @@ struct Inputs {
     const float*     state;           ///< Proprioception, length @c real_state_dim.
     const float*     noise;           ///< Initial noise for the action expert.
 
+    /// Minimal Qantara predictor inputs. Latents use row-major [history, latent_dim]
+    /// layout and actions use [history - 1, action_block_dim]. The two noise
+    /// vectors each contain one flattened action block.
+    const float*     qantara_latents = nullptr;
+    int              qantara_history = 0;
+    const float*     qantara_actions = nullptr;
+    int              qantara_action_blocks = 0;
+    const float*     qantara_video_noise = nullptr;
+    const float*     qantara_action_noise = nullptr;
+
     /// Optional LingBot-VA previous action condition in C,F,H layout.
     /// For LIBERO this is unnormalised 7,4,4 action history and is converted
     /// to the internal 1,30,4,4,1 condition tensor by the model.
