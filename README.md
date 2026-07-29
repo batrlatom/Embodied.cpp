@@ -28,11 +28,12 @@
     - [1.2 Runtime Roadmap](#12-runtime-roadmap)
   - [2. 🚀 Quick Start](#2--quick-start)
     - [2.1 Clone the Repo](#21-clone-the-repo)
-    - [2.2 Get GGUF Weights](#22-get-gguf-weights)
-    - [2.3 Install System Dependencies](#23-install-system-dependencies)
-    - [2.4 Build by Model and Backend](#24-build-by-model-and-backend)
-    - [2.5 Start a Server](#25-start-a-server)
-    - [2.6 Evaluate in Simulation](#26-evaluate-in-simulation)
+    - [2.2 Multi-model CUDA Docker](#22-multi-model-cuda-docker)
+    - [2.3 Get GGUF Weights](#23-get-gguf-weights)
+    - [2.4 Install System Dependencies](#24-install-system-dependencies)
+    - [2.5 Build by Model and Backend](#25-build-by-model-and-backend)
+    - [2.6 Start a Server](#26-start-a-server)
+    - [2.7 Evaluate in Simulation](#27-evaluate-in-simulation)
   - [3. 🧪 Evaluate in Simulation](#3--evaluate-in-simulation)
     - [3.1 LIBERO](#31-libero)
     - [3.2 RoboTwin](#32-robotwin)
@@ -113,7 +114,45 @@ LLAMA_PATCH_PROFILE=all ./patches/init_third_party.sh
 Use a clean `third_party/llama.cpp` when switching profiles; patch state is tied
 to that source tree rather than to an individual CMake build directory.
 
-### 2.2 Get GGUF Weights
+### 2.2 Multi-model CUDA Docker
+
+The Docker image builds all currently supported CUDA servers once: pi0.5,
+HY-VLA, GR00T N1.7, and LingBot-VA. Model files are deliberately kept out of
+the image. On the first run, the selected model is downloaded into `/models`;
+subsequent runs reuse the same files. Mount a host directory at `/models` so
+model downloads survive container replacement.
+
+```bash
+mkdir -p .embodied-models
+
+docker buildx build --load \
+  --build-arg 'CUDA_ARCHITECTURES=86;120' \
+  -t embodied:cuda .
+```
+
+Select one model with `MODEL=pi05`, `MODEL=hy_vla`, `MODEL=groot_n1`, or
+`MODEL=lingbot_va`:
+
+```bash
+# Optional: download and validate assets without starting a server.
+docker run --rm --gpus all \
+  -e MODEL=lingbot_va \
+  --mount type=bind,src="$PWD/.embodied-models",dst=/models \
+  embodied:cuda prepare
+
+# Start the selected server. This also performs the first-run download.
+docker run --rm --gpus all --network host \
+  -e MODEL=lingbot_va \
+  --mount type=bind,src="$PWD/.embodied-models",dst=/models \
+  embodied:cuda server
+```
+
+The `prepare` command uses a lock and checks existing files, so interrupted or
+repeated runs do not redownload completed model files. `HF_TOKEN` can be passed
+with `-e HF_TOKEN=...` if a future model asset requires Hugging Face
+authentication.
+
+### 2.3 Get GGUF Weights
 
 Pre-converted GGUF releases for `Embodied.cpp` are available on Hugging Face:
 
@@ -150,7 +189,7 @@ You can also convert upstream checkpoints yourself with the scripts in
 [`scripts/`](scripts/), but for most users the Hugging Face GGUF releases are
 the fastest way to get started.
 
-### 2.3 Install System Dependencies
+### 2.4 Install System Dependencies
 
 Install the required system packages for your platform before building.
 
@@ -175,7 +214,7 @@ it.
 brew install cmake protobuf zeromq cppzmq pkg-config uv
 ```
 
-### 2.4 Build by Model and Backend
+### 2.5 Build by Model and Backend
 
 Model switches default to `OFF`. Enable only the runtimes you need.
 
@@ -290,7 +329,7 @@ This combined build uses GR00T's strict CUDA settings for the shared GGML CUDA
 backend. Use separate build directories and the narrower patch profiles above
 when you want each model's default performance-oriented backend settings.
 
-### 2.5 Start a Server
+### 2.6 Start a Server
 
 ```bash
 # VLA server (pi0.5)
@@ -322,7 +361,7 @@ is enabled at configure time. GR00T disables backbone flash attention by default
 to keep intermediate tensors close to the official implementation. Set
 `VLA_GROOT_FLASH_ATTN=1` to opt into the faster fused path.
 
-### 2.6 Evaluate in Simulation
+### 2.7 Evaluate in Simulation
 
 **pi0.5 on LIBERO:**
 

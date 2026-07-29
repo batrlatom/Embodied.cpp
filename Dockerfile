@@ -10,7 +10,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LIBERO_CONFIG_PATH=/root/.libero \
     PYTHONUNBUFFERED=1 \
     NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+    MODEL_CACHE_DIR=/models \
+    HF_HOME=/models/.cache/huggingface
 
 WORKDIR /opt/embodied
 
@@ -34,54 +36,15 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && python -m pip install --no-cache-dir uv huggingface_hub
 
-# This stage is independent of the CUDA architecture. It is reused when only
-# CUDA_ARCHITECTURES changes, so llama.cpp is not cloned or patched again.
+# All model implementations use the combined llama.cpp patch profile. This
+# stage is independent of the CUDA architecture and is reused across builds.
 FROM base AS source
 ARG LLAMA_REF=b9016
 COPY . .
-RUN LLAMA_REF="${LLAMA_REF}" LLAMA_PATCH_PROFILE=pi05 \
+RUN LLAMA_REF="${LLAMA_REF}" LLAMA_PATCH_PROFILE=all \
         bash patches/init_third_party.sh
 
-# Model and tokenizer assets are independent of the C++ build. The BuildKit
-# cache keeps Hugging Face downloads across architecture rebuilds.
-FROM base AS assets
-ARG PI05_HF_REPO=SEU-PAISys/Embodied.cpp
-ARG PI05_HF_REVISION=main
-
-RUN --mount=type=cache,id=embodied-hf,target=/root/.cache/huggingface \
-    mkdir -p /root/.cache/openpi /opt/embodied/checkpoints/pi05 \
-    && wget -q --show-progress \
-        -O /root/.cache/openpi/paligemma_tokenizer.model \
-        https://storage.googleapis.com/big_vision/paligemma_tokenizer.model \
-    && test "$(stat -c '%s' /root/.cache/openpi/paligemma_tokenizer.model)" = "4264023" \
-    && PI05_HF_REPO="${PI05_HF_REPO}" PI05_HF_REVISION="${PI05_HF_REVISION}" \
-        python - <<'PY'
-import os
-from huggingface_hub import hf_hub_download
-
-repo_id = os.environ["PI05_HF_REPO"]
-revision = os.environ["PI05_HF_REVISION"]
-local_dir = "/opt/embodied/checkpoints/pi05"
-
-for filename in (
-    "pi05_libero_finetuned_v044/pi05-mmproj.gguf",
-    "pi05_libero_finetuned_v044/pi05.gguf",
-):
-    hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        revision=revision,
-        local_dir=local_dir,
-    )
-PY
-RUN mv /opt/embodied/checkpoints/pi05/pi05_libero_finetuned_v044/pi05-mmproj.gguf \
-        /opt/embodied/checkpoints/pi05/pi05-mmproj.gguf \
-    && mv /opt/embodied/checkpoints/pi05/pi05_libero_finetuned_v044/pi05.gguf \
-        /opt/embodied/checkpoints/pi05/pi05.gguf \
-    && rm -rf /opt/embodied/checkpoints/pi05/pi05_libero_finetuned_v044
-
-# The simulator environment is also independent of the CUDA architecture.
-# Cache uv's package downloads so a later rebuild does not redownload wheels.
+# The simulator environment is independent of the CUDA architecture.
 FROM base AS libero
 COPY eval/sim/libero/setup_libero.sh eval/sim/libero/setup_libero.sh
 RUN --mount=type=cache,id=embodied-uv,target=/root/.cache/uv \
@@ -90,8 +53,9 @@ RUN --mount=type=cache,id=embodied-uv,target=/root/.cache/uv \
         eval/sim/libero/LIBERO \
     && bash eval/sim/libero/setup_libero.sh
 
-# Only this stage depends on the selected GPU architecture. For the RTX 3090
-# and RTX 5080 together, pass --build-arg 'CUDA_ARCHITECTURES=86;120'.
+# Build every currently supported server once. Only this stage depends on the
+# selected CUDA architectures. We intentionally do not download model weights
+# here; they are fetched on first run into the persistent /models directory.
 FROM base AS build
 ARG CUDA_ARCHITECTURES=86;120
 COPY . .
@@ -104,7 +68,15 @@ RUN cmake -S . -B build -G Ninja \
         -DGGML_CUDA_FAST_MATH=OFF \
         -DGGML_CUDA_FORCE_CUBLAS=ON \
         -DMODEL_BUILD_VLA_PI05=ON \
-    && cmake --build build --target vla-pi05-server --parallel
+        -DMODEL_BUILD_VLA_HY_VLA=ON \
+        -DMODEL_BUILD_VLA_GROOT_N1=ON \
+        -DMODEL_BUILD_WAM_LINGBOT_VA=ON \
+    && cmake --build build --target \
+        vla-pi05-server \
+        vla-hy-vla-server \
+        vla-groot-n1-server \
+        wam-lingbot-server \
+        --parallel
 
 FROM base
 COPY . .
@@ -113,14 +85,14 @@ COPY --from=libero /opt/embodied/eval/sim/libero/LIBERO \
     /opt/embodied/eval/sim/libero/LIBERO
 COPY --from=libero /opt/embodied/eval/sim/libero/libero_uv \
     /opt/embodied/eval/sim/libero/libero_uv
-COPY --from=assets /root/.cache/openpi \
-    /root/.cache/openpi
-COPY --from=assets /opt/embodied/checkpoints/pi05 \
-    /opt/embodied/checkpoints/pi05
 
+COPY docker/model_assets.sh /usr/local/bin/embodied-model-assets
 COPY docker/entrypoint.sh /usr/local/bin/embodied-entrypoint
-RUN chmod 0755 /usr/local/bin/embodied-entrypoint
+RUN chmod 0755 /usr/local/bin/embodied-model-assets \
+    /usr/local/bin/embodied-entrypoint \
+    && mkdir -p /models
 
+VOLUME ["/models"]
 EXPOSE 5555
 ENTRYPOINT ["/usr/local/bin/embodied-entrypoint"]
 CMD ["server"]
