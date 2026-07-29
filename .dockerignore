@@ -1,0 +1,13 @@
+.git
+.gitignore
+build
+build-*
+checkpoints
+third_party
+eval/sim/libero/LIBERO
+eval/sim/libero/libero_uv
+outputs
+__pycache__
+*.pyc
+*.pyo
+*.swp
