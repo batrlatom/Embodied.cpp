@@ -64,21 +64,14 @@ RUN git -c http.version=HTTP/1.1 clone --depth 1 \
         eval/sim/libero/LIBERO \
     && bash eval/sim/libero/setup_libero.sh
 
-# The C++ client uses the PaliGemma SentencePiece model. Cache it at the
-# fallback path understood by eval/client/vla_cpp_client.py.
+# The C++ client uses the PaliGemma SentencePiece model. OpenPI publishes the
+# exact tokenizer anonymously in its public GCS assets, so this does not
+# require accepting Google's gated Hugging Face model terms or passing a token.
 RUN mkdir -p /root/.cache/openpi \
-    && python - <<'PY'
-from huggingface_hub import hf_hub_download
-
-hf_hub_download(
-    repo_id="google/paligemma-3b-pt-224",
-    filename="tokenizer.model",
-    revision="main",
-    local_dir="/root/.cache/openpi",
-)
-PY
-RUN mv /root/.cache/openpi/tokenizer.model \
-        /root/.cache/openpi/paligemma_tokenizer.model
+    && wget -q --show-progress \
+        -O /root/.cache/openpi/paligemma_tokenizer.model \
+        https://storage.googleapis.com/big_vision/paligemma_tokenizer.model \
+    && test "$(stat -c '%s' /root/.cache/openpi/paligemma_tokenizer.model)" = "4264023"
 
 # Download the model artifacts used by the documented LIBERO pi0.5 command.
 RUN mkdir -p /opt/embodied/checkpoints/pi05 \
