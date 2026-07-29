@@ -59,7 +59,8 @@ AdapterStatus VlaModelInputAdapter::build(const Observation& observation,
     if (!out) {
         return AdapterStatus::error("ModelInputStorage must not be null");
     }
-    if (observation.language_tokens.empty() && observation.instruction.empty()) {
+    if (config_.require_language &&
+        observation.language_tokens.empty() && observation.instruction.empty()) {
         return AdapterStatus::error(
             "observation.language_tokens or observation.instruction must not be empty");
     }

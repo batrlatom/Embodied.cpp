@@ -52,6 +52,15 @@ message PredictRequest {
   repeated uint32 backbone_attention_mask       = 11;
   repeated uint32 backbone_image_mask           = 12;
   string          language_text                 = 13;
+
+  // Qantara keeps frame-spaced latent/action history per session. Set reset
+  // on the first observation of every episode. Subsequent requests provide
+  // the raw action block actually executed after the preceding response.
+  uint64         qantara_session_id      = 14;
+  bool           qantara_reset           = 15;
+  repeated float qantara_previous_action = 16;
+  repeated float qantara_video_noise     = 17;
+  repeated float qantara_action_noise    = 18;
 }
 
 message PredictResponse {

@@ -166,6 +166,11 @@ struct Inputs {
     int              qantara_action_blocks = 0;
     const float*     qantara_video_noise = nullptr;
     const float*     qantara_action_noise = nullptr;
+    uint64_t         qantara_session_id = 0;
+    bool             qantara_reset = false;
+    const float*     qantara_previous_action = nullptr;
+    int              qantara_previous_action_n = 0;
+    bool             qantara_encode_only = false;
 
     /// Optional LingBot-VA previous action condition in C,F,H layout.
     /// For LIBERO this is unnormalised 7,4,4 action history and is converted

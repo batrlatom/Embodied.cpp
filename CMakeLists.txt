@@ -11,7 +11,8 @@ option(MODEL_BUILD_VLA_PI05 "Build pi0.5 runtime support" OFF)
 option(MODEL_BUILD_VLA_HY_VLA "Build HY-VLA runtime support" OFF)
 option(MODEL_BUILD_VLA_GROOT_N1 "Build NVIDIA GR00T N1 runtime support" OFF)
 option(MODEL_BUILD_WAM_LINGBOT_VA "Build LingBot-VA runtime support" OFF)
-option(MODEL_BUILD_WAM_QANTARA "Build minimal Qantara predictor runtime support" OFF)
+option(MODEL_BUILD_WAM_QANTARA "Build Qantara policy runtime support" OFF)
+option(EMBODIED_BUILD_SERVERS "Build ZeroMQ/Protobuf serving targets" ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -60,11 +61,23 @@ target_link_libraries(vla_core PUBLIC llama ggml mtmd)
 
 if(MODEL_BUILD_WAM_QANTARA)
     add_executable(qantara-predictor-bench eval/qantara_predictor_bench.cpp)
+    add_executable(qantara-encoder-bench eval/qantara_encoder_bench.cpp)
+    add_executable(qantara-policy-bench eval/qantara_policy_bench.cpp)
     target_include_directories(qantara-predictor-bench PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     )
+    target_include_directories(qantara-encoder-bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    )
+    target_include_directories(qantara-policy-bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    )
     target_link_libraries(qantara-predictor-bench PRIVATE vla_core)
+    target_link_libraries(qantara-encoder-bench PRIVATE vla_core)
+    target_link_libraries(qantara-policy-bench PRIVATE vla_core)
 endif()
 
 set(EMBODIED_ENABLED_MODELS "")
@@ -131,8 +144,10 @@ if(GGML_CUDA)
     endif()
 endif()
 
-if(MODEL_BUILD_VLA_PI05 OR MODEL_BUILD_VLA_HY_VLA OR
-   MODEL_BUILD_VLA_GROOT_N1 OR MODEL_BUILD_WAM_LINGBOT_VA)
+if(EMBODIED_BUILD_SERVERS AND
+   (MODEL_BUILD_VLA_PI05 OR MODEL_BUILD_VLA_HY_VLA OR
+   MODEL_BUILD_VLA_GROOT_N1 OR MODEL_BUILD_WAM_LINGBOT_VA OR
+   MODEL_BUILD_WAM_QANTARA))
 find_package(Protobuf REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZeroMQ REQUIRED IMPORTED_TARGET libzmq)
@@ -182,6 +197,10 @@ endif()
 
 if(MODEL_BUILD_VLA_GROOT_N1)
     add_vla_server_target(vla-groot-n1-server)
+endif()
+
+if(MODEL_BUILD_WAM_QANTARA)
+    add_vla_server_target(wam-qantara-server)
 endif()
 
 if(MODEL_BUILD_WAM_LINGBOT_VA)

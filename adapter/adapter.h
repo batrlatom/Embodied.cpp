@@ -37,6 +37,7 @@ struct AdapterConfig {
     int64_t action_steps = 0;
     bool pad_state = true;
     bool allow_missing_noise = true;
+    bool require_language = true;
 };
 
 struct ModelInputStorage {

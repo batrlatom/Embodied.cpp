@@ -126,8 +126,8 @@ void usage(const char * prog) {
         "[--backbone PATH] "
         "[<mmproj.gguf>] <ckpt>\n"
         "  <mmproj.gguf>           pi0.5 vision-tower mmproj GGUF. Omit for HY-VLA\n"
-        "                          and LingBot-VA combined GGUF checkpoints.\n"
-        "  <ckpt>                  pi0.5, HY-VLA, or LingBot-VA GGUF checkpoint; the\n"
+        "                          LingBot-VA and Qantara combined GGUF checkpoints.\n"
+        "  <ckpt>                  pi0.5, HY-VLA, LingBot-VA, or Qantara checkpoint; the\n"
         "                          architecture is auto-detected from metadata.\n"
         "  --bind ADDR             ZMQ bind address (default: tcp://*:5555)\n"
         "  --timing-detail LEVEL   per-request timing breakdown (default: none)\n"
@@ -187,7 +187,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr,
                      "vla-server: expected 1 or 2 positional args "
                      "(<mmproj.gguf> <ckpt> for pi0.5, or just <ckpt> "
-                     "for HY-VLA/LingBot-VA), got %zu\n",
+                     "for HY-VLA/LingBot-VA/Qantara), got %zu\n",
                      positionals.size());
         usage(argv[0]);
         return 1;
@@ -220,6 +220,7 @@ int main(int argc, char ** argv) {
             cfg.n_suffix,
             true,
             true,
+            cfg.n_lang > 0,
         });
 
     zmq::context_t zctx( 1);
@@ -273,8 +274,9 @@ int main(int argc, char ** argv) {
             sock.send(zmq::buffer(body), zmq::send_flags::none);
             continue;
         }
-        if ((req.lang_tokens_size() < 1 && req.language_text().empty()) ||
-            req.lang_tokens_size() > int(cfg.n_lang)) {
+        if (cfg.n_lang > 0 &&
+            ((req.lang_tokens_size() < 1 && req.language_text().empty()) ||
+             req.lang_tokens_size() > int(cfg.n_lang))) {
             char buf[128]; std::snprintf(buf, sizeof(buf),
                 "lang_tokens length %d out of range [0, %lld] without language_text",
                 req.lang_tokens_size(), (long long) cfg.n_lang);
@@ -307,6 +309,23 @@ int main(int argc, char ** argv) {
                 "noise length %d != 0 or %d (chunk_size * action_dim)",
                 req.noise_size(), expected_noise_n);
             sock.send(zmq::buffer(make_error_response(rid, buf)), zmq::send_flags::none);
+            continue;
+        }
+        if (req.qantara_previous_action_size() != 0 &&
+            req.qantara_previous_action_size() != expected_noise_n) {
+            char buf[160]; std::snprintf(buf, sizeof(buf),
+                "qantara_previous_action length %d != 0 or %d",
+                req.qantara_previous_action_size(), expected_noise_n);
+            sock.send(zmq::buffer(make_error_response(rid, buf)), zmq::send_flags::none);
+            continue;
+        }
+        if ((req.qantara_video_noise_size() != 0 &&
+             req.qantara_video_noise_size() != expected_noise_n) ||
+            (req.qantara_action_noise_size() != 0 &&
+             req.qantara_action_noise_size() != expected_noise_n)) {
+            sock.send(zmq::buffer(make_error_response(
+                rid, "Qantara noise vectors must be empty or one action block")),
+                zmq::send_flags::none);
             continue;
         }
 
@@ -485,6 +504,19 @@ int main(int argc, char ** argv) {
             backbone_image_mask.empty() ? nullptr : backbone_image_mask.data();
         model_input.inputs.backbone_image_mask_n = static_cast<int>(backbone_image_mask.size());
         model_input.inputs.timing_detail    = timing_detail;
+        model_input.inputs.qantara_session_id = req.qantara_session_id();
+        model_input.inputs.qantara_reset = req.qantara_reset();
+        model_input.inputs.qantara_previous_action =
+            req.qantara_previous_action_size() > 0
+                ? req.qantara_previous_action().data() : nullptr;
+        model_input.inputs.qantara_previous_action_n =
+            req.qantara_previous_action_size();
+        model_input.inputs.qantara_video_noise =
+            req.qantara_video_noise_size() > 0
+                ? req.qantara_video_noise().data() : nullptr;
+        model_input.inputs.qantara_action_noise =
+            req.qantara_action_noise_size() > 0
+                ? req.qantara_action_noise().data() : nullptr;
 
         std::vector<float> action_chunk = vla::predict(model, model_input.inputs);
         const auto & st = vla::last_stats(model);

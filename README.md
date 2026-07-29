@@ -504,7 +504,7 @@ GGUF conversion scripts are in [`scripts/`](scripts/):
 | `prepare_groot_n1_backbone.py` | Extracted, layer-truncated Qwen3-VL Hugging Face directory |
 | `convert_hy_vla_to_gguf.py` | HY-VLA combined vision+action |
 | `convert_lingbot_va_to_gguf.py` | LingBot-VA transformer + companion GGUFs |
-| `convert_qantara_to_gguf.py` | Minimal Qantara dense predictor |
+| `convert_qantara_to_gguf.py` | Qantara ViT encoder and dense predictor |
 
 Quantization helpers:
 
@@ -517,13 +517,17 @@ If you do not need a custom conversion, prefer the prebuilt GGUF releases at:
 
 - https://huggingface.co/SEU-PAISys/Embodied.cpp
 
-### Qantara predictor parity prototype
+### Qantara native policy
 
-The initial Qantara integration isolates the dense predictor used by the
-`video_inverse` action-block latency measurement. It accepts precomputed
-Qantara latents, aligned previous action blocks, and fixed video/action noise.
-It does not yet include the ViT encoder, server-side episode history,
-multicamera/task conditioning, prefix planning, or RoboTTT.
+The Qantara runtime converts and runs the dense single-camera checkpoint
+end-to-end: native image preprocessing, ViT-Tiny encoding, latent projection,
+stateful frame/action history, flow prediction, action denormalization, and
+clipping. The ZeroMQ server keeps history isolated by session ID, so the
+Robomimic client only sends the current `agentview` frame and the preceding
+five-action block.
+
+This path matches the checkpoint's single-camera policy. Multicamera/task
+conditioning, prefix planning, and RoboTTT are outside its scope.
 
 Prepare llama.cpp, convert a dense single-camera checkpoint, and build:
 
@@ -532,14 +536,16 @@ Prepare llama.cpp, convert a dense single-camera checkpoint, and build:
 
 python scripts/convert_qantara_to_gguf.py \
   /path/to/qantara-checkpoint.pt \
-  checkpoints/qantara-predictor-f32.gguf \
+  checkpoints/qantara-f32.gguf \
   --flow-steps 4
 
 cmake -S . -B build-qantara \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_SHARED_LIBS=OFF \
   -DMODEL_BUILD_WAM_QANTARA=ON
-cmake --build build-qantara --target qantara-predictor-bench -j$(nproc)
+cmake --build build-qantara \
+  --target wam-qantara-server qantara-policy-bench qantara-predictor-bench \
+  -j$(nproc)
 ```
 
 `BUILD_SHARED_LIBS=OFF` is useful on filesystems that do not support symbolic
@@ -547,7 +553,24 @@ links. For CUDA, also pass `-DGGML_CUDA=ON`,
 `-DCMAKE_CUDA_COMPILER=<path-to-nvcc>`, and the appropriate
 `-DCMAKE_CUDA_ARCHITECTURES` value.
 
-Generate a deterministic fixture and compare native output with PyTorch:
+Start the episode-aware server:
+
+```bash
+./build-qantara/wam-qantara-server \
+  --bind tcp://0.0.0.0:5555 \
+  checkpoints/qantara-f32.gguf
+```
+
+Use `VlaCppClient(arch="qantara")` from `eval/client/vla_cpp_client.py`.
+It defaults to `observation.images.agentview`, resets server history when
+`reset()` is called, and consumes all five returned actions before sending the
+executed block with the next frame. The server accepts RGB uint8 or float
+images at arbitrary resolution and applies the checkpoint's 84×84 resize and
+ImageNet normalization.
+
+The precomputed-latent benchmark remains available for focused predictor
+parity. Generate a deterministic fixture and compare native output with
+PyTorch:
 
 ```bash
 python eval/export_qantara_parity.py \
@@ -556,7 +579,7 @@ python eval/export_qantara_parity.py \
   --qantara-repo /path/to/qantara/source \
   --flow-steps 4 \
   --executable build-qantara/qantara-predictor-bench \
-  --gguf checkpoints/qantara-predictor-f32.gguf
+  --gguf checkpoints/qantara-f32.gguf
 ```
 
 ## 5. 🗂️ Project Structure
@@ -565,7 +588,7 @@ What lives where, in plain language:
 
 | Directory | What it contains |
 |---|---|
-| `models/` | C++ model implementations (pi0.5, GR00T N1.7, HY-VLA, LingBot-VA, Qantara predictor) |
+| `models/` | C++ model implementations (pi0.5, GR00T N1.7, HY-VLA, LingBot-VA, Qantara) |
 | `runtime/` | Model registry, architecture detection, shared utilities |
 | `adapter/` | I/O boundary — translates sensor/simulator data into typed inputs the models understand |
 | `serving/` | Server code (ZeroMQ/Protobuf) for VLA and LingBot APIs |

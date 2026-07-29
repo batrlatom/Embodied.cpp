@@ -7,17 +7,12 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Convert a minimal Qantara predictor checkpoint to GGUF.
-
-The first Embodied.cpp integration intentionally exports only the dense
-Qantara predictor.  Vision latents and action history are supplied by the
-caller, which isolates the component used by Qantara's action-block latency
-benchmark and keeps parity debugging small.
-"""
+"""Convert a dense single-camera Qantara checkpoint to GGUF."""
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -78,7 +73,7 @@ def _add_metadata(
 ) -> None:
     backbone = cfg["backbone"]
     writer.add_string(KV("architecture"), ARCH)
-    writer.add_string(KV("format_stage"), "predictor_f32")
+    writer.add_string(KV("format_stage"), "full_policy_f32")
     writer.add_uint32(KV("format_version"), 1)
     writer.add_uint32(KV("latent_dim"), int(cfg["latent_dim"]))
     writer.add_uint32(KV("hidden_dim"), int(cfg["hidden_dim"]))
@@ -95,6 +90,9 @@ def _add_metadata(
     writer.add_float32(KV("rope_theta"), 10_000.0)
     writer.add_uint32(KV("image_size"), int(backbone["image_size"]))
     writer.add_uint32(KV("patch_size"), int(backbone["patch_size"]))
+    writer.add_uint32(KV("vision_depth"), int(backbone["vit_depth"]))
+    writer.add_uint32(KV("vision_heads"), int(backbone["vit_heads"]))
+    writer.add_uint32(KV("vision_mlp_dim"), int(backbone["vit_mlp_dim"]))
     writer.add_array(KV("action_mean"), action_mean.float().tolist())
     writer.add_array(KV("action_std"), action_std.float().tolist())
 
@@ -110,6 +108,44 @@ def _add_tensor(
         value,
         raw_dtype=gguf.GGMLQuantizationType.F32,
     )
+
+
+def _encoder_name(source: str) -> str:
+    direct = {
+        "encoder.backbone.cls": "qantara.vision.cls",
+        "encoder.backbone.position": "qantara.vision.position",
+        "encoder.backbone.patch.weight": "qantara.vision.patch.weight",
+        "encoder.backbone.patch.bias": "qantara.vision.patch.bias",
+        "encoder.backbone.blocks.norm.weight": "qantara.vision.norm.weight",
+        "encoder.backbone.blocks.norm.bias": "qantara.vision.norm.bias",
+        "encoder.projector.0.weight": "qantara.encoder.proj_in.weight",
+        "encoder.projector.0.bias": "qantara.encoder.proj_in.bias",
+        "encoder.projector.3.weight": "qantara.encoder.proj_out.weight",
+        "encoder.projector.3.bias": "qantara.encoder.proj_out.bias",
+    }
+    if source in direct:
+        return direct[source]
+    match = re.fullmatch(
+        r"encoder\.backbone\.blocks\.layers\.(\d+)\.(.+)", source
+    )
+    if not match:
+        raise KeyError(f"unmapped encoder tensor {source}")
+    layer, suffix = match.groups()
+    suffixes = {
+        "self_attn.in_proj_weight": "attn_qkv.weight",
+        "self_attn.in_proj_bias": "attn_qkv.bias",
+        "self_attn.out_proj.weight": "attn_out.weight",
+        "self_attn.out_proj.bias": "attn_out.bias",
+        "linear1.weight": "ffn_up.weight",
+        "linear1.bias": "ffn_up.bias",
+        "linear2.weight": "ffn_down.weight",
+        "linear2.bias": "ffn_down.bias",
+        "norm1.weight": "norm1.weight",
+        "norm1.bias": "norm1.bias",
+        "norm2.weight": "norm2.weight",
+        "norm2.bias": "norm2.bias",
+    }
+    return f"qantara.vision.blk.{layer}.{suffixes[suffix]}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,6 +182,31 @@ def main() -> None:
 
     count = 0
     state = checkpoint["model"]
+    _add_tensor(writer, "qantara.action_mean", action_mean)
+    _add_tensor(writer, "qantara.action_std", action_std)
+    count += 2
+
+    encoder_bn_prefix = "encoder.projector.1"
+    encoder_bn_scale = state[f"{encoder_bn_prefix}.weight"].float() / torch.sqrt(
+        state[f"{encoder_bn_prefix}.running_var"].float() + 1.0e-5
+    )
+    encoder_bn_offset = (
+        state[f"{encoder_bn_prefix}.bias"].float()
+        - state[f"{encoder_bn_prefix}.running_mean"].float() * encoder_bn_scale
+    )
+    _add_tensor(writer, "qantara.encoder.proj_norm.scale", encoder_bn_scale)
+    _add_tensor(writer, "qantara.encoder.proj_norm.offset", encoder_bn_offset)
+    count += 2
+    for source_name, tensor in state.items():
+        if not source_name.startswith("encoder."):
+            continue
+        if source_name.endswith("num_batches_tracked"):
+            continue
+        if source_name.startswith(encoder_bn_prefix + "."):
+            continue
+        _add_tensor(writer, _encoder_name(source_name), tensor)
+        count += 1
+
     bn_prefix = "predictor.state_head.net.1"
     bn_scale = state[f"{bn_prefix}.weight"].float() / torch.sqrt(
         state[f"{bn_prefix}.running_var"].float() + 1.0e-5
@@ -174,7 +235,7 @@ def main() -> None:
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
     writer.close()
-    print(f"wrote {count} predictor tensors to {args.output}")
+    print(f"wrote {count} Qantara tensors to {args.output}")
 
 
 if __name__ == "__main__":

@@ -60,6 +60,15 @@ ARCH_PRESETS = {
         "n_action_steps": 8,
         "use_server_tokenizer": True,
     },
+    "qantara": {
+        "image_size": 84,
+        "image_keys": ("observation.images.agentview",),
+        "tokenizer": None,
+        "max_state_dim": 0,
+        "max_length": 0,
+        "n_action_steps": 5,
+        "use_server_tokenizer": True,
+    },
 }
 
 
@@ -196,10 +205,7 @@ class VlaCppClient:
         image_size: int | None = None,
         max_state_dim: int | None = None,
         real_action_dim: int = 7,
-        image_keys: Sequence[str] = (
-            "observation.images.image",
-            "observation.images.image2",
-        ),
+        image_keys: Sequence[str] | None = None,
         max_length: int | None = None,
         recv_timeout_ms: int = DEFAULT_RECV_TIMEOUT_MS,
         n_action_steps: int | None = None,
@@ -216,6 +222,14 @@ class VlaCppClient:
         n_action_steps = (
             n_action_steps if n_action_steps is not None else preset.get("n_action_steps", 1)
         )
+        if image_keys is None:
+            image_keys = preset.get(
+                "image_keys",
+                (
+                    "observation.images.image",
+                    "observation.images.image2",
+                ),
+            )
         use_server_tokenizer = bool(preset.get("use_server_tokenizer", False))
         if tokenizer_name is None and not use_server_tokenizer:
             raise ValueError(f"arch={arch} has no default tokenizer; pass --tokenizer.")
@@ -273,9 +287,19 @@ class VlaCppClient:
         self._last_response = None
         self._inference_sequence = 0
         self._last_inference_profile: dict[str, float | int] | None = None
+        self._qantara_session_id = (
+            (os.getpid() & 0xFFFFFFFF) << 32
+        ) | (id(self) & 0xFFFFFFFF)
+        self._qantara_reset_pending = True
+        self._qantara_previous_chunk: np.ndarray | None = None
 
         if n_action_steps < 1:
             raise ValueError(f"n_action_steps must be >= 1, got {n_action_steps}")
+        if arch == "qantara" and n_action_steps != 5:
+            raise ValueError(
+                "Qantara requires n_action_steps=5 so each history entry "
+                "contains the complete executed action block"
+            )
         self.n_action_steps = n_action_steps
         self._action_queue: deque[np.ndarray] = deque(maxlen=n_action_steps)
 
@@ -289,6 +313,8 @@ class VlaCppClient:
         self._action_queue.clear()
         self._step = 0
         self._last_inference_profile = None
+        self._qantara_reset_pending = True
+        self._qantara_previous_chunk = None
 
     def get_last_inference_profile(self) -> dict[str, float | int] | None:
         if self._last_inference_profile is None:
@@ -324,12 +350,16 @@ class VlaCppClient:
                     self.image_size,
                     self.image_crop_size,
                 )
+            elif self.arch == "qantara":
+                # Preserve the source frame. The native encoder performs the
+                # checkpoint's direct bilinear resize and normalization.
+                pass
             else:
                 img = _resize_with_pad(img, self.image_size, self.image_size, pad_value=0.0)
             img_hwc = np.transpose(img, (1, 2, 0))
             images_f32.append(np.ascontiguousarray(img_hwc, dtype=np.float32))
 
-        state = observations["observation.state"]
+        state = observations.get("observation.state", np.empty(0, dtype=np.float32))
         if isinstance(state, torch.Tensor):
             state = state.numpy()
         state = np.asarray(state, dtype=np.float32).reshape(-1)
@@ -344,7 +374,7 @@ class VlaCppClient:
         if isinstance(task, bytes):
             task = task.decode()
         task = str(task)
-        if self.arch == "groot_n1":
+        if self.arch in {"groot_n1", "qantara"}:
             task = re.sub(r"[^\w\s]", "", task.lower()).strip()
             lang = None
             toks = None
@@ -378,7 +408,7 @@ class VlaCppClient:
             ip.data = img.tobytes()
         if self.arch == "groot_n1":
             req.language_text = task
-        else:
+        elif self.arch != "qantara":
             assert lang is not None
             req.lang_tokens.extend(lang.tolist())
         req.state.extend(state_padded.tolist())
@@ -386,7 +416,25 @@ class VlaCppClient:
         action_noise = observations.get("action_noise")
         if action_noise is not None:
             noise = np.ascontiguousarray(action_noise, dtype=np.float32).reshape(-1)
-            req.noise.extend(noise.tolist())
+            if self.arch == "qantara":
+                req.qantara_action_noise.extend(noise.tolist())
+            else:
+                req.noise.extend(noise.tolist())
+        if self.arch == "qantara":
+            req.qantara_session_id = self._qantara_session_id
+            req.qantara_reset = self._qantara_reset_pending
+            self._qantara_reset_pending = False
+            if self._qantara_previous_chunk is not None:
+                req.qantara_previous_action.extend(
+                    self._qantara_previous_chunk.reshape(-1).tolist()
+                )
+            video_noise = observations.get("video_noise")
+            if video_noise is not None:
+                req.qantara_video_noise.extend(
+                    np.ascontiguousarray(
+                        video_noise, dtype=np.float32
+                    ).reshape(-1).tolist()
+                )
 
         self.sock.send(req.SerializeToString())
         body = self.sock.recv()
@@ -408,10 +456,13 @@ class VlaCppClient:
             "model_action_dim": int(resp.action_dim),
             "replay_chunk_size": int(self.n_action_steps),
         }
-        return np.array(resp.action_chunk, dtype=np.float32).reshape(
+        chunk = np.array(resp.action_chunk, dtype=np.float32).reshape(
             resp.chunk_size,
             resp.action_dim,
         )
+        if self.arch == "qantara":
+            self._qantara_previous_chunk = np.ascontiguousarray(chunk)
+        return chunk
 
     def close(self):
         try:

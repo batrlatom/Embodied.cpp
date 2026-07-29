@@ -22,9 +22,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace vla {
@@ -83,6 +85,22 @@ struct Block {
     Linear condition;
 };
 
+struct VisionBlock {
+    ggml_tensor * norm1_weight = nullptr;
+    ggml_tensor * norm1_bias = nullptr;
+    ggml_tensor * qkv_weight = nullptr;
+    ggml_tensor * qkv_bias = nullptr;
+    Linear out;
+    ggml_tensor * norm2_weight = nullptr;
+    ggml_tensor * norm2_bias = nullptr;
+    Linear mlp_up, mlp_down;
+};
+
+struct Session {
+    std::deque<std::vector<float>> latents;
+    std::deque<std::vector<float>> actions;
+};
+
 struct QantaraModel final : ModelArchBase {
     int64_t latent = 0;
     int64_t action_block = 0;
@@ -93,6 +111,10 @@ struct QantaraModel final : ModelArchBase {
     int64_t mlp_dim = 0;
     float rms_eps = 1.0e-6f;
     float rope_theta = 10000.0f;
+    int64_t image_size = 0;
+    int64_t patch_size = 0;
+    int64_t vision_heads = 0;
+    int64_t vision_depth = 0;
 
     ggml_backend_t backend = nullptr;
     ggml_context * weights_ctx = nullptr;
@@ -107,6 +129,20 @@ struct QantaraModel final : ModelArchBase {
     ggml_tensor * state_bn_scale = nullptr;
     ggml_tensor * state_bn_offset = nullptr;
     Linear state_head_out, action_head;
+    ggml_tensor * vision_patch_weight = nullptr;
+    ggml_tensor * vision_patch_bias = nullptr;
+    ggml_tensor * vision_cls = nullptr;
+    ggml_tensor * vision_position = nullptr;
+    std::vector<VisionBlock> vision_blocks;
+    ggml_tensor * vision_final_norm_weight = nullptr;
+    ggml_tensor * vision_final_norm_bias = nullptr;
+    Linear encoder_projector_in;
+    ggml_tensor * encoder_bn_scale = nullptr;
+    ggml_tensor * encoder_bn_offset = nullptr;
+    Linear encoder_projector_out;
+    std::vector<float> action_mean;
+    std::vector<float> action_std;
+    std::unordered_map<uint64_t, Session> sessions;
     std::mt19937 rng{0};
     int n_threads = 4;
 
@@ -117,6 +153,7 @@ struct QantaraModel final : ModelArchBase {
         if (backend) ggml_backend_free(backend);
     }
     std::vector<float> predict(const Inputs & in) override;
+    bool encode(const ImageView & image, std::vector<float> * output);
 };
 
 ggml_tensor * mm(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * x) {
@@ -342,20 +379,253 @@ std::vector<float> time_features(
     return result;
 }
 
+ggml_tensor * layer_norm(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    ggml_tensor * weight,
+    ggml_tensor * bias
+) {
+    return ggml_add(
+        ctx, ggml_mul(ctx, ggml_norm(ctx, x, 1.0e-5f), weight), bias);
+}
+
+ggml_tensor * build_vision_block(
+    ggml_context * ctx,
+    const VisionBlock & block,
+    ggml_tensor * x,
+    int64_t heads
+) {
+    const int64_t width = x->ne[0];
+    const int64_t sequence = x->ne[1];
+    const int64_t head_dim = width / heads;
+    ggml_tensor * normalized = layer_norm(
+        ctx, x, block.norm1_weight, block.norm1_bias);
+    ggml_tensor * qkv = ggml_add(
+        ctx, mm(ctx, block.qkv_weight, normalized), block.qkv_bias);
+    const size_t stride = qkv->nb[1];
+    const size_t offset = static_cast<size_t>(width) * sizeof(float);
+    ggml_tensor * q = ggml_cont(
+        ctx, ggml_view_2d(ctx, qkv, width, sequence, stride, 0));
+    ggml_tensor * k = ggml_cont(
+        ctx, ggml_view_2d(ctx, qkv, width, sequence, stride, offset));
+    ggml_tensor * v = ggml_cont(
+        ctx, ggml_view_2d(ctx, qkv, width, sequence, stride, 2 * offset));
+    q = ggml_reshape_3d(ctx, q, head_dim, heads, sequence);
+    k = ggml_reshape_3d(ctx, k, head_dim, heads, sequence);
+    v = ggml_reshape_3d(ctx, v, head_dim, heads, sequence);
+    ggml_tensor * attended = attention(
+        ctx, q, k, v, nullptr, width, sequence, head_dim);
+    x = ggml_add(ctx, x, linear(ctx, block.out, attended));
+    normalized = layer_norm(ctx, x, block.norm2_weight, block.norm2_bias);
+    ggml_tensor * hidden = ggml_gelu_erf(
+        ctx, linear(ctx, block.mlp_up, normalized));
+    return ggml_add(ctx, x, linear(ctx, block.mlp_down, hidden));
+}
+
+bool preprocess_qantara_image(
+    const ImageView & image, int side, std::vector<float> * output
+) {
+    if (!image.data || image.w < 1 || image.h < 1 || side < 1) return false;
+    constexpr float mean[3] = {0.485f, 0.456f, 0.406f};
+    constexpr float stddev[3] = {0.229f, 0.224f, 0.225f};
+    output->resize(static_cast<size_t>(3 * side * side));
+    auto pixel = [&](int y, int x, int channel) {
+        y = std::max(0, std::min(image.h - 1, y));
+        x = std::max(0, std::min(image.w - 1, x));
+        if (image.format == PixelFormat::U8) {
+            const auto * data = static_cast<const uint8_t *>(image.data);
+            return data[
+                (static_cast<size_t>(y) * image.w + x) * 3 + channel] / 255.0f;
+        }
+        const auto * data = static_cast<const float *>(image.data);
+        return data[(static_cast<size_t>(y) * image.w + x) * 3 + channel];
+    };
+    for (int y = 0; y < side; ++y) {
+        const float source_y =
+            (static_cast<float>(y) + 0.5f) * image.h / side - 0.5f;
+        const int y_floor = static_cast<int>(std::floor(source_y));
+        const int y0 = std::max(0, std::min(image.h - 1, y_floor));
+        const int y1 = std::max(0, std::min(image.h - 1, y_floor + 1));
+        const float wy = source_y - std::floor(source_y);
+        for (int x = 0; x < side; ++x) {
+            const float source_x =
+                (static_cast<float>(x) + 0.5f) * image.w / side - 0.5f;
+            const int x_floor = static_cast<int>(std::floor(source_x));
+            const int x0 = std::max(0, std::min(image.w - 1, x_floor));
+            const int x1 = std::max(0, std::min(image.w - 1, x_floor + 1));
+            const float wx = source_x - std::floor(source_x);
+            for (int channel = 0; channel < 3; ++channel) {
+                const float top =
+                    pixel(y0, x0, channel) * (1.0f - wx) +
+                    pixel(y0, x1, channel) * wx;
+                const float bottom =
+                    pixel(y1, x0, channel) * (1.0f - wx) +
+                    pixel(y1, x1, channel) * wx;
+                const float value = top * (1.0f - wy) + bottom * wy;
+                (*output)[
+                    static_cast<size_t>(channel * side * side + y * side + x)] =
+                    (value - mean[channel]) / stddev[channel];
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
+
+bool QantaraModel::encode(
+    const ImageView & image, std::vector<float> * output
+) {
+    using Clock = std::chrono::high_resolution_clock;
+    const auto started = Clock::now();
+    const int64_t grid = image_size / patch_size;
+    const int64_t patches = grid * grid;
+    const int64_t sequence = patches + 1;
+    ggml_init_params params{64u * 1024u * 1024u, nullptr, true};
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+    ggml_tensor * pixels = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, image_size, image_size, 3);
+    ggml_set_input(pixels);
+    ggml_tensor * convolution = ggml_conv_2d(
+        ctx, vision_patch_weight, pixels,
+        static_cast<int>(patch_size), static_cast<int>(patch_size),
+        0, 0, 1, 1);
+    ggml_tensor * patch_tokens = ggml_transpose(
+        ctx, ggml_reshape_2d(ctx, convolution, patches, cfg.hidden));
+    patch_tokens = ggml_add(ctx, ggml_cont(ctx, patch_tokens), vision_patch_bias);
+    ggml_tensor * x = ggml_concat(ctx, vision_cls, patch_tokens, 1);
+    x = ggml_add(ctx, x, vision_position);
+    for (const VisionBlock & block : vision_blocks) {
+        x = build_vision_block(ctx, block, x, vision_heads);
+    }
+    x = layer_norm(
+        ctx, x, vision_final_norm_weight, vision_final_norm_bias);
+    ggml_tensor * cls = column(ctx, x, 0);
+    ggml_tensor * projected = linear(ctx, encoder_projector_in, cls);
+    projected = ggml_add(
+        ctx, ggml_mul(ctx, projected, encoder_bn_scale), encoder_bn_offset);
+    projected = ggml_gelu_erf(ctx, projected);
+    projected = linear(ctx, encoder_projector_out, projected);
+    ggml_set_output(projected);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32768, false);
+    ggml_build_forward_expand(graph, projected);
+    ggml_gallocr_t allocator = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
+        if (allocator) ggml_gallocr_free(allocator);
+        ggml_free(ctx);
+        return false;
+    }
+    std::vector<float> preprocessed;
+    if (!preprocess_qantara_image(
+            image, static_cast<int>(image_size), &preprocessed)) {
+        ggml_gallocr_free(allocator);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_tensor_set(
+        pixels, preprocessed.data(), 0, preprocessed.size() * sizeof(float));
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    output->resize(static_cast<size_t>(latent));
+    if (status == GGML_STATUS_SUCCESS) {
+        ggml_backend_tensor_get(
+            projected, output->data(), 0, output->size() * sizeof(float));
+    } else {
+        output->clear();
+    }
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    stats.ms_vision += std::chrono::duration<float, std::milli>(
+        Clock::now() - started).count();
+    return status == GGML_STATUS_SUCCESS;
+}
 
 std::vector<float> QantaraModel::predict(const Inputs & in) {
     using Clock = std::chrono::high_resolution_clock;
     const auto started = Clock::now();
     stats = {};
-    const int64_t history = in.qantara_history;
-    if (!in.qantara_latents || history < 1 || history >= max_frames) {
+    if (in.qantara_encode_only) {
+        if (!in.images || in.n_images != 1) return {};
+        std::vector<float> encoded;
+        if (!encode(in.images[0], &encoded)) return {};
+        stats.ms_total = std::chrono::duration<float, std::milli>(
+            Clock::now() - started).count();
+        return encoded;
+    }
+    const bool session_mode = in.qantara_latents == nullptr;
+    const float * latent_values = in.qantara_latents;
+    const float * action_values = in.qantara_actions;
+    int64_t history = in.qantara_history;
+    int64_t action_blocks = in.qantara_action_blocks;
+    std::vector<float> flattened_latents;
+    std::vector<float> flattened_actions;
+    if (session_mode) {
+        if (!in.images || in.n_images != 1) {
+            std::fprintf(stderr, "vla(qantara): session inference needs one image\n");
+            return {};
+        }
+        if (in.qantara_reset) {
+            sessions.erase(in.qantara_session_id);
+        }
+        Session & session = sessions[in.qantara_session_id];
+        if (!session.latents.empty()) {
+            if (!in.qantara_previous_action ||
+                in.qantara_previous_action_n != action_block) {
+                std::fprintf(
+                    stderr,
+                    "vla(qantara): non-initial request needs the executed action block\n");
+                return {};
+            }
+            std::vector<float> normalized(static_cast<size_t>(action_block));
+            for (int64_t i = 0; i < action_block; ++i) {
+                const int64_t dimension = i % cfg.real_action_dim;
+                normalized[static_cast<size_t>(i)] =
+                    (in.qantara_previous_action[i] -
+                     action_mean[static_cast<size_t>(dimension)]) /
+                    action_std[static_cast<size_t>(dimension)];
+            }
+            session.actions.push_back(std::move(normalized));
+        }
+        std::vector<float> current_latent;
+        if (!encode(in.images[0], &current_latent)) {
+            std::fprintf(stderr, "vla(qantara): vision encoding failed\n");
+            return {};
+        }
+        session.latents.push_back(std::move(current_latent));
+        while (session.latents.size() >
+               static_cast<size_t>(max_frames - 1)) {
+            session.latents.pop_front();
+            if (!session.actions.empty()) session.actions.pop_front();
+        }
+        if (session.actions.size() + 1 != session.latents.size()) {
+            std::fprintf(stderr, "vla(qantara): session history lost alignment\n");
+            return {};
+        }
+        history = static_cast<int64_t>(session.latents.size());
+        action_blocks = static_cast<int64_t>(session.actions.size());
+        flattened_latents.reserve(static_cast<size_t>(history * latent));
+        for (const auto & value : session.latents) {
+            flattened_latents.insert(
+                flattened_latents.end(), value.begin(), value.end());
+        }
+        flattened_actions.reserve(
+            static_cast<size_t>(action_blocks * action_block));
+        for (const auto & value : session.actions) {
+            flattened_actions.insert(
+                flattened_actions.end(), value.begin(), value.end());
+        }
+        latent_values = flattened_latents.data();
+        action_values = flattened_actions.empty()
+            ? nullptr : flattened_actions.data();
+    }
+    if (!latent_values || history < 1 || history >= max_frames) {
         std::fprintf(stderr, "vla(qantara): expected 1..%lld history latents\n",
                      static_cast<long long>(max_frames - 1));
         return {};
     }
-    if (in.qantara_action_blocks != history - 1 ||
-        (history > 1 && !in.qantara_actions)) {
+    if (action_blocks != history - 1 ||
+        (history > 1 && !action_values)) {
         std::fprintf(stderr, "vla(qantara): action history is not aligned\n");
         return {};
     }
@@ -422,14 +692,13 @@ std::vector<float> QantaraModel::predict(const Inputs & in) {
     }
 
     ggml_backend_tensor_set(
-        z_history, in.qantara_latents, 0,
+        z_history, latent_values, 0,
         static_cast<size_t>(latent * history) * sizeof(float));
-    std::vector<float> empty_action(static_cast<size_t>(action_block), 0.0f);
-    ggml_backend_tensor_set(
-        action_history,
-        history > 1 ? in.qantara_actions : empty_action.data(), 0,
-        static_cast<size_t>(action_block * std::max<int64_t>(1, history - 1)) *
-            sizeof(float));
+    if (history > 1) {
+        ggml_backend_tensor_set(
+            action_history, action_values, 0,
+            static_cast<size_t>(action_block * (history - 1)) * sizeof(float));
+    }
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<float> generated_video(static_cast<size_t>(action_block));
     std::vector<float> generated_action(static_cast<size_t>(action_block));
@@ -488,6 +757,17 @@ std::vector<float> QantaraModel::predict(const Inputs & in) {
     if (status == GGML_STATUS_SUCCESS) {
         ggml_backend_tensor_get(
             action, result.data(), 0, result.size() * sizeof(float));
+        if (session_mode) {
+            for (int64_t i = 0; i < action_block; ++i) {
+                const int64_t dimension = i % cfg.real_action_dim;
+                result[static_cast<size_t>(i)] =
+                    result[static_cast<size_t>(i)] *
+                    action_std[static_cast<size_t>(dimension)] +
+                    action_mean[static_cast<size_t>(dimension)];
+                result[static_cast<size_t>(i)] = std::max(
+                    -1.0f, std::min(1.0f, result[static_cast<size_t>(i)]));
+            }
+        }
     } else {
         std::fprintf(stderr, "vla(qantara): graph compute failed (%d)\n",
                      static_cast<int>(status));
@@ -521,6 +801,10 @@ std::unique_ptr<ModelArchBase> qantara_create(
     model->cfg.n_suffix = reader.u32("qantara.frameskip");
     model->action_block = reader.u32("qantara.action_block_dim");
     model->flow_steps = reader.u32("qantara.flow_steps");
+    model->image_size = reader.u32("qantara.image_size");
+    model->patch_size = reader.u32("qantara.patch_size");
+    model->vision_depth = reader.u32("qantara.vision_depth");
+    model->vision_heads = reader.u32("qantara.vision_heads");
     model->cfg.num_steps = static_cast<int>(model->flow_steps);
     model->cfg.head_dim = model->head_dim;
     model->cfg.n_q_heads = model->heads;
@@ -532,7 +816,7 @@ std::unique_ptr<ModelArchBase> qantara_create(
     model->cfg.rms_eps = reader.f32("qantara.rms_norm_eps");
     model->rms_eps = model->cfg.rms_eps;
     model->rope_theta = reader.f32("qantara.rope_theta");
-    model->cfg.n_img = 0;
+    model->cfg.n_img = 1;
     model->cfg.n_lang = 0;
     model->cfg.n_state = 0;
     model->cfg.max_state_dim = 0;
@@ -594,6 +878,37 @@ std::unique_ptr<ModelArchBase> qantara_create(
     model->state_bn_offset = make("qantara.state_head.net.1.offset");
     model->state_head_out = make_linear("qantara.state_head.net.3");
     model->action_head = make_linear("qantara.action_head");
+    model->vision_cls = make("qantara.vision.cls");
+    model->vision_position = make("qantara.vision.position");
+    model->vision_patch_weight = make("qantara.vision.patch.weight");
+    model->vision_patch_bias = make("qantara.vision.patch.bias");
+    model->vision_blocks.resize(static_cast<size_t>(model->vision_depth));
+    for (int64_t i = 0; i < model->vision_depth; ++i) {
+        const std::string prefix =
+            "qantara.vision.blk." + std::to_string(i);
+        VisionBlock & block = model->vision_blocks[static_cast<size_t>(i)];
+        block.norm1_weight = make(prefix + ".norm1.weight");
+        block.norm1_bias = make(prefix + ".norm1.bias");
+        block.qkv_weight = make(prefix + ".attn_qkv.weight");
+        block.qkv_bias = make(prefix + ".attn_qkv.bias");
+        block.out = make_linear(prefix + ".attn_out");
+        block.norm2_weight = make(prefix + ".norm2.weight");
+        block.norm2_bias = make(prefix + ".norm2.bias");
+        block.mlp_up = make_linear(prefix + ".ffn_up");
+        block.mlp_down = make_linear(prefix + ".ffn_down");
+    }
+    model->vision_final_norm_weight = make(
+        "qantara.vision.norm.weight");
+    model->vision_final_norm_bias = make(
+        "qantara.vision.norm.bias");
+    model->encoder_projector_in = make_linear(
+        "qantara.encoder.proj_in");
+    model->encoder_bn_scale = make(
+        "qantara.encoder.proj_norm.scale");
+    model->encoder_bn_offset = make(
+        "qantara.encoder.proj_norm.offset");
+    model->encoder_projector_out = make_linear(
+        "qantara.encoder.proj_out");
     if (std::any_of(weights.begin(), weights.end(), [](ggml_tensor * value) {
             return value == nullptr;
         })) return nullptr;
@@ -607,6 +922,19 @@ std::unique_ptr<ModelArchBase> qantara_create(
             return nullptr;
         }
         ggml_backend_tensor_set(tensor, bytes.data(), 0, bytes.size());
+    }
+    model->action_mean.resize(
+        static_cast<size_t>(model->cfg.real_action_dim));
+    model->action_std.resize(
+        static_cast<size_t>(model->cfg.real_action_dim));
+    if (!reader.read(
+            "qantara.action_mean", model->action_mean.data(),
+            model->action_mean.size() * sizeof(float)) ||
+        !reader.read(
+            "qantara.action_std", model->action_std.data(),
+            model->action_std.size() * sizeof(float))) {
+        std::fprintf(stderr, "vla(qantara): failed to load action statistics\n");
+        return nullptr;
     }
     std::printf(
         "vla(qantara): loaded predictor (%.1f MiB, frames=%lld, flow_steps=%lld)\n",
