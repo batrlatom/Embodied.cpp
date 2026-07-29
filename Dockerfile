@@ -78,13 +78,12 @@ RUN cmake -S . -B build -G Ninja \
         wam-lingbot-server \
         --parallel
 
-FROM base
+# Keep the LIBERO environment as the final stage's base. uv may create the
+# Python 3.10 interpreter in its managed runtime directory; copying only the
+# venv would leave its python symlink pointing at a missing interpreter.
+FROM libero
 COPY . .
 COPY --from=build /opt/embodied/build /opt/embodied/build
-COPY --from=libero /opt/embodied/eval/sim/libero/LIBERO \
-    /opt/embodied/eval/sim/libero/LIBERO
-COPY --from=libero /opt/embodied/eval/sim/libero/libero_uv \
-    /opt/embodied/eval/sim/libero/libero_uv
 
 COPY docker/model_assets.sh /usr/local/bin/embodied-model-assets
 COPY docker/entrypoint.sh /usr/local/bin/embodied-entrypoint

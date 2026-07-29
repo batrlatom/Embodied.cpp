@@ -8,9 +8,16 @@ PORT="${PORT:-5555}"
 HY_VLA_FILE="${HY_VLA_FILE:-Hy-Embodied-0.5-VLA-RoboTwin/Hy-Embodied-0.5-VLA-RoboTwin_q4_K.gguf}"
 ASSETS="${ROOT}/docker/model_assets.sh"
 PYTHON="${ROOT}/eval/sim/libero/libero_uv/bin/python"
-if [[ ! -x "${PYTHON}" ]]; then
-    PYTHON="${ROOT}/eval/sim/libero/libero_uv/.venv/bin/python"
-fi
+for candidate in \
+    "${ROOT}/eval/sim/libero/libero_uv/.venv/bin/python" \
+    "${ROOT}/eval/sim/libero/libero_uv/.venv/bin/python3" \
+    "${ROOT}/eval/sim/libero/libero_uv/.venv/bin/python3.10" \
+    "${ROOT}/eval/sim/libero/libero_uv/bin/python"; do
+    if [[ -x "${candidate}" ]]; then
+        PYTHON="${candidate}"
+        break
+    fi
+done
 
 normalize_model() {
     case "$1" in
